@@ -42,10 +42,10 @@ LiveBench coding, BFCL, RULER) and the method are in [zrresearch/evals](https://
 
 | Test | Official limits | Longer limits |
 |---|---|---|
-| Terminal-Bench 2.1, Terminus 2 | 16 / 89 (18.0%) | 26 / 89 (29.2%) at 6× |
+| Terminal-Bench 2.1, Terminus 2 | 16 / 89 (18.0%) | 27 / 89 (30.3%) at 6× |
 | Cybench, Codex, 3 attempts | 17 / 40 tasks (45 min) | 25 / 40 tasks (135 min) |
 
-At official limits most tasks run out of time: with the server shared, each stream decodes at about 8 to 11 tokens per
+One 6× task that failed to start (a harness tmux error, not the model) was rerun with the same settings and solved. At official limits most tasks run out of time: with the server shared, each stream decodes at about 8 to 11 tokens per
 second, and decode slows further as an agent's context grows (table above).
 
 ## What the patch changes
