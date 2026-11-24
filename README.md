@@ -8,6 +8,8 @@ architectures found for major versions [10]") and several other kernels need har
 NVLink multicast, more than 99 KB of shared memory per block). This repo patches that image so the model runs on GB10,
 and adds three decode speed changes.
 
+Model page on Hugging Face: [umzcio/Inkling-2-Small-DGX-Spark](https://huggingface.co/umzcio/Inkling-2-Small-DGX-Spark).
+
 ## Results (four Sparks, tuned build)
 
 **Decode**, tokens per second (one stream: that stream's rate; others: total output including prompt time):
