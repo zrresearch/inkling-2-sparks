@@ -1,0 +1,107 @@
+--- a/vllm/models/inkling2/moe.py
++++ b/vllm/models/inkling2/moe.py
+@@ -35,6 +35,7 @@
+ import os as _os
+ _MOE_TP = _os.environ.get('INKLING_MOE_TP') == '1'
+ from .ops import gb10_cache as _CACHE
++_GATES = {}  # layer index -> Inkling2Gate (prefetch uses the next layer's router)
+ _CACHE_LAYERS = [0]  # layer index of the next Inkling2Experts built
+ 
+ QuantFormat = Literal["nvfp4", "mxfp8"]
+@@ -102,6 +103,7 @@
+             (config.intermediate_size // self.ep_size // 32) % 4 == 0)
+         self.layer_index = _CACHE_LAYERS[0]; _CACHE_LAYERS[0] += 1
+         self.cache = None
++        self._pred = None  # layer L+1's predicted experts for this step (set by Inkling2MoE.forward)
+         if self.tp_experts:
+             assert config.intermediate_size % (64 * self.ep_size) == 0
+             self.num_experts = config.n_routed_experts
+@@ -231,7 +233,7 @@
+             getattr(self, f"{name}_weight_outer_scale_denominator"),
+         )
+ 
+-    def _gemm(self, quantized, name: str, tiles, plan, projection: int):
++    def _gemm(self, quantized, name: str, tiles, plan, projection: int, slot_map=None, out=None):
+         act, act_scale, row_scale = quantized
+         return bmm(
+             act,
+@@ -243,7 +245,8 @@
+             tiles,
+             plan,
+             projection,
+-            slot_map=None if self.cache is None else self.cache.slot_map,
++            slot_map=slot_map,
++            out=out,
+         )
+ 
+     def forward(
+@@ -261,10 +264,30 @@
+         expert rows and ``src2dst`` for the consumer to combine and reduce,
+         or pushes their combine to the token shard owners."""
+         src2dst, gammas, rows, tiles = routing
+-        if self.cache is not None:
+-            self.cache.ensure(tiles, plan.max_ctas)
+-        gate_up = self._gemm(quantized, "w13", tiles, plan, 0)
+         m = plan.max_ctas
++        sm13 = sm2 = None
++        grouped = False
++        if self.cache is not None:
++            self.cache.wait()
++            sm13, sm2 = self.cache.slot_maps
++            need = self.cache.experts_of(tiles, m)
++            grouped = len(need) > self.cache.nslots
++            if not grouped:
++                self.cache.ensure(need)
++                pred, self._pred = self._pred, None
++                nxt = _CACHE.CACHES.get(self.layer_index + 1)
++                if pred is not None and nxt is not None:  # after this layer's loads: one load in flight at a time
++                    nxt.prefetch(sorted(set(pred.tolist())))
++            self._pred = None
++        if not grouped:
++            gate_up = self._gemm(quantized, "w13", tiles, plan, 0, sm13)
++        else:  # more experts than slots (a long prompt chunk): gate/up in slot-sized groups into one buffer
++            _CACHE.STATS["grouped_steps"] += 1
++            gate_up = None
++            for g in self.cache.groups(0, need):
++                self.cache.halves[0].ensure(g)
++                mt = _CACHE.masked_tiles(tiles, m, plan.tile, g, self.num_experts)
++                gate_up = self._gemm(quantized, "w13", mt, plan, 0, sm13, gate_up)
+         activated = swiglu_quantize(
+             gate_up,
+             gammas,
+@@ -275,7 +298,14 @@
+             *self.scales("w2"),
+         )
+         del gate_up
+-        down = self._gemm(activated, "w2", tiles, plan, 1)
++        if not grouped:
++            down = self._gemm(activated, "w2", tiles, plan, 1, sm2)
++        else:
++            down = None
++            for g in self.cache.groups(1, need):
++                self.cache.halves[1].ensure(g)
++                mt = _CACHE.masked_tiles(tiles, m, plan.tile, g, self.num_experts)
++                down = self._gemm(activated, "w2", mt, plan, 1, sm2, down)
+         if push is not None:
+             # Each rank's fp32 combine is rounded once to bf16.
+             combine_push(down, src2dst, self.topk, push)
+@@ -295,6 +325,7 @@
+         self.experts = Inkling2Experts(config, quant_format)
+         from .ops import expert_stats as _es  # STATS_HOOK
+         self.stats_layer = _es.register(config.n_routed_experts, get_tensor_model_parallel_rank())
++        _GATES[self.experts.layer_index] = self.gate
+ 
+     def forward(
+         self,
+@@ -325,6 +356,11 @@
+         if self.stats_layer is not None:
+             from .ops import expert_stats as _es
+             _es.record(self.stats_layer, x, gate.weight, gate.bias, gate.topk, is_padding)
++        nxt = _GATES.get(experts.layer_index + 1)
++        if (experts.cache is not None and _CACHE.PREFETCH and nxt is not None
++                and x.shape[0] <= _CACHE.PREFETCH_TOKENS):
++            # layer L+1's router on layer L's input: a guess at L+1's experts, loaded while this layer computes
++            experts._pred = ((x @ nxt.weight.t()).float().sigmoid() + nxt.bias).topk(nxt.topk, dim=-1).indices.flatten()
+         routing, quantized = route(
+             x,
+             gate.weight,

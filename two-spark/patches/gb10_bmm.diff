@@ -1,0 +1,19 @@
+--- a/vllm/models/inkling2/ops/gb10_bmm.py
++++ b/vllm/models/inkling2/ops/gb10_bmm.py
+@@ -159,13 +159,14 @@
+ 
+ 
+ def bmm(act, act_scale, row_scale, weight, weight_scale, ones, tiles, plan, projection=0, config=None, kernel=None,
+-        slot_map=None):
++        slot_map=None, out=None):
+     """bf16 [plan.rows, N]. NVFP4: ``weight`` uint8 [E, N, K/2], ``weight_scale`` e4m3 [E, N, K/16].
+     MXFP8: ``weight`` e4m3 [E, N, K], ``weight_scale`` ue8m0 uint8 [E, N, K/32]. Natural layout (unshuffled)."""
+     nvfp4 = weight.dtype == torch.uint8
+     n, k = weight.shape[1], weight.shape[2] * (2 if nvfp4 else 1)
+     m = plan.max_ctas
+-    out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
++    if out is None:
++        out = torch.empty((plan.rows, n), dtype=torch.bfloat16, device=act.device)
+     bm, bn, bk, warps, stages = config or (CONFIGS if nvfp4 else MX_CONFIGS)[plan.tile]
+     while k % bk:  # the K loop has no mask: TP-sharded experts give w2 K = 2304 / TP (576 at TP=4)
+         bk //= 2

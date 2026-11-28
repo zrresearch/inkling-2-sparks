@@ -1,4 +1,4 @@
-# Inkling 2 Small on four DGX Sparks
+# Inkling 2 Small on DGX Sparks (four, or two)
 
 Thinking Machines' [Inkling 2 Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) (594B mixture of experts,
 17B active, NVFP4, 366 GiB) served on **four DGX Sparks (GB10)** with vLLM, 256K context, 16 streams.
@@ -7,6 +7,9 @@ Thinking Machines' vLLM image targets B200-class GPUs. On GB10 its expert kernel
 architectures found for major versions [10]") and several other kernels need hardware GB10 lacks (tensor memory,
 NVLink multicast, more than 99 KB of shared memory per block). This repo patches that image so the model runs on GB10,
 and adds three decode speed changes.
+
+A two-Spark build serves the same checkpoint on two Sparks at about 9 tokens/s for one user, by keeping the most-used
+experts in memory and reading the rest from each Spark's NVMe (see [Two Sparks](#two-sparks)).
 
 Model page on Hugging Face: [umzcio/Inkling-2-Small-DGX-Spark](https://huggingface.co/umzcio/Inkling-2-Small-DGX-Spark).
 
@@ -94,6 +97,68 @@ cd serve && cp nodes.conf.example nodes.conf   # fill in addresses, RoCE devices
 
 `serve4.sh` starts the tuned build with the recommended settings. For the reference build: `EXTRA_ENV="" ./serve4.sh start`.
 
+## Two Sparks
+
+The checkpoint is 366 GiB and two Sparks have about 240 GiB of memory, so the two-Spark build does not hold every
+expert in memory. Each Spark keeps its half of every non-expert weight, plus 176 of the 384 experts per layer (its half
+of each), and reads the rest from its own NVMe when the router picks them. The kept set starts from the experts our
+test suite used most and changes as the conversation goes (least recently used out).
+
+**Results** (two Sparks, one direct QSFP cable):
+
+| | Two Sparks | Four Sparks (tuned) |
+|---|---|---|
+| Decode, 1 stream | 9.2 tok/s | 30.2 tok/s |
+| Decode, 4 streams (total) | about 7 tok/s | 58.5 tok/s |
+| WikiText perplexity | 3.0691 | 3.0732 (reference build 3.0697) |
+| Context | 128K, about 280K tokens of cache | 256K, about 380K tokens of cache |
+
+- One stream: 300 tokens after a 48-token prompt, warm cache. The first request after start runs at about 8.4 tok/s
+  while the cache fills.
+- Four streams: a 90-minute run with four users sending short questions, essays, and 8K and 32K-token prompts with a
+  planted fact to recall: 209 requests, none failed, 60/60 recalls right, 7.1 tok/s in total. More users share the
+  same disk reads, so total speed does not grow with streams. **This is a one-user build.**
+- Long prompts are slow: with four streams active, a 32K-token prompt took about two minutes to answer.
+- Perplexity matches the four-Spark reference build to 0.02%: the arithmetic is the same, only where the expert
+  weights come from changes. We have not rerun the Tier 2 quality suite on two Sparks.
+
+**How it works**
+
+- Experts are split across the two Sparks (`INKLING_MOE_TP` at TP=2, all 48 layers), so each Spark reads only its half
+  of a missing expert: about 9 MiB (NVFP4 layers) or 16 MiB (MXFP8 layers).
+- After each layer's router runs, the missing experts are read from that Spark's NVMe with O_DIRECT into pinned memory
+  and copied into free slots. Bypassing the page cache made a layer's typical reads 3x faster (1.4 ms instead of
+  4 ms), which took decode from 4.1 to 9.2 tok/s.
+- Prompt steps that need more experts than there are slots run in groups of slot size.
+- The cache syncs to the CPU in every MoE layer, so the server runs in eager mode (no CUDA graphs).
+- Reading the next layer's experts ahead of time (`INKLING_EXPERT_PREFETCH=1`) is implemented but slower (7.4 tok/s):
+  only about 60% of the guesses were used. It is off by default.
+
+**Setup**
+
+Hardware: two DGX Sparks joined by one QSFP cable (RoCE), NVMe with fast random reads (ours read 9-10 GB/s), about
+190 GiB free on each Spark, Docker with the NVIDIA runtime.
+
+```bash
+# once, on a machine with the full checkpoint (366 GiB): the expert packs and the slim checkpoint
+python3 two-spark/pack_experts.py /path/to/Inkling-2-Small /path/to/packs      # rank0/ + rank1/, ~175 GiB each
+python3 two-spark/make_slim.py   /path/to/Inkling-2-Small /path/to/slim        # 13 GiB: everything except expert weights
+# into the same folder (BASE in nodes2.conf) on both Sparks: slim/, packs/index.json, two-spark/expert-usage.npy;
+# packs/rank0 on the head, packs/rank1 on the worker
+
+# both Sparks: the four-Spark image, then the two-Spark layer on top
+(cd build && docker build -t inkling2-gb10 .)
+(cd two-spark && docker build -t inkling2-gb10:tp2 .)
+
+# head Spark
+cd two-spark && cp nodes2.conf.example nodes2.conf   # paths, worker address, RoCE devices, interfaces
+./serve2.sh start
+./serve2.sh logs
+```
+
+`SLOTS` (default 176) sets experts kept per layer; each extra slot costs about 467 MiB per Spark across the 48 layers
+and comes out of the context cache.
+
 ## Known faults and their fixes
 
 **Prefix caching corrupts replies with vLLM's default CUDA graphs.** With the default `cudagraph_mode`
@@ -124,8 +189,8 @@ All take a server URL (default `http://localhost:8899`).
 
 ## Limits
 
-Text only; no speculative decoding (DSpark needs NVLink multicast); four Sparks only (the checkpoint does not fit in
-two Sparks' memory; a two-Spark setup is future work). Decode at long context is limited by our attention kernel in
+Text only; no speculative decoding (DSpark needs NVLink multicast); on two Sparks, see [Two Sparks](#two-sparks): about 9
+tokens/s for one user, and it does not scale with more users. Decode at long context is limited by our attention kernel in
 the 8 global layers, which is not yet tuned.
 
 ## License and credits

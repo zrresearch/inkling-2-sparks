@@ -1,0 +1,14 @@
+# Copy to nodes2.conf. Rank 0 is the Spark you run serve2.sh on; rank 1 is the other one.
+# Folder on BOTH Sparks holding slim/ (checkpoint without expert weights), packs/ (index.json + that Spark's rank dir)
+# and expert-usage.npy (copy from this folder: router counts that pick the experts kept in memory at start).
+BASE=/path/to/inkling2-2x
+# Fabric address of rank 0 on the cable between the two (the torch.distributed rendezvous).
+MASTER=10.0.0.1
+# ssh targets for ranks 0-1 ("local" for the head).
+NODES=("local" "user@10.0.0.2")
+# Network interface on the cable, per rank (the two ends can have different names).
+IFNAMES=("enp1s0f0np0" "enp1s0f0np0")
+# RoCE devices per rank (ibdev2netdev).
+HCAS=("rocep1s0f0,roceP2p1s0f0" "rocep1s0f0,roceP2p1s0f0")
+# RoCE v2 GID index for the fabric address (show_gids).
+GID_INDEX=3

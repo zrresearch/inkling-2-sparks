@@ -1,0 +1,14 @@
+--- a/vllm/models/inkling2/model.py
++++ b/vllm/models/inkling2/model.py
+@@ -748,6 +748,11 @@
+                 loaded.add(name)
+         if self.visual is not None:
+             loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
++        # Expert cache (INKLING_EXPERT_CACHE): the four large per-expert tensors are filled from the expert pack, not
++        # read from the (slim) checkpoint.
++        from .ops import gb10_cache as _CACHE
++        if _CACHE.enabled():
++            loaded |= {n for n in params if n.rsplit(".", 1)[-1] in _CACHE.ExpertCache.PIECES and ".mlp.experts." in n}
+         if missing := params.keys() - loaded:
+             raise ValueError(f"Missing checkpoint tensors: {sorted(missing)}")
+         return loaded
